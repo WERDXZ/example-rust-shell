@@ -1,0 +1,13 @@
+#!/bin/bash
+
+test_file=$1
+
+if [[ -z "$test_file" ]]; then
+  echo "Usage: $0 <test_file>"
+  exit 1
+fi
+
+diff -u <(${DRIVER} -t "${test_file}" -s "${TSHREF}" -a "${TSHARGS}") \
+         <(${DRIVER} -t "${test_file}" -s "${TSH}" -a "${TSHARGS}") > /dev/null 2>&1
+
+exit $?
