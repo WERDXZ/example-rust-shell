@@ -1,13 +1,223 @@
-#!/bin/bash
+#!/usr/bin/python
+import os
+import re
+import sys
+import subprocess
 
-test_file=$1
+def trace01(tsh):
+    try:
+        tsh = tsh.split("\n")[3:]
+        # make sure it only has a blank line after the header.
+        if len(tsh) > 1 and len(tsh[0]) > 0:
+            return False
+        return True
+    except:
+        return False
 
-if [[ -z "$test_file" ]]; then
-  echo "Usage: $0 <test_file>"
-  exit 1
-fi
 
-diff -u <(${DRIVER} -t "${test_file}" -s "${TSHREF}" -a "${TSHARGS}") \
-         <(${DRIVER} -t "${test_file}" -s "${TSH}" -a "${TSHARGS}") > /dev/null 2>&1
+def trace02(tsh):
+    try:
+        tsh = tsh.split("\n")[3:]
+        # make sure it only has a blank line after the header.
+        if len(tsh) > 1 and len(tsh[0]) > 0:
+            return False
+        return True
+    except:
+        return False
 
-exit $?
+
+def trace03(tsh):
+    try:
+        lines = tsh.split("\n")[3:]
+        # make sure it only has a blank line at end.
+        if len(lines) > 2 and len(lines[1]) > 0:
+            return False
+        if not lines[0] == "tsh> quit":
+            return False
+        return True
+    except:
+        return False
+
+
+def trace04(tsh):
+    try:
+        test = r"tsh> \.\/myspin 1 \&\s*\[1\] \([0-9]+\) \.\/myspin 1 \&"
+        line1 = re.search(test, tsh)
+        if line1 == None:
+            return False
+        return True
+    except:
+        return False
+
+
+def trace05(tsh):
+    try:
+        test = r"tsh> \.\/myspin 2 \&\s*\[1\] \([0-9]+\) \.\/myspin 2 \&\s*tsh> \.\/myspin 3 \&\s*\[2\] \([0-9]+\) \.\/myspin 3 \&\s*tsh> jobs\s*\[1\] \([0-9]+\) Running \.\/myspin 2 \&\s*\[2\] \([0-9]+\) Running \.\/myspin 3 \&"
+        line1 = re.search(test, tsh)
+        if line1 == None:
+            return False
+        return True
+    except:
+        return False
+
+
+def trace06(tsh):
+    try:
+        test = r"tsh> \.\/myspin 4\s*Job \[1\] \([0-9]+\) terminated by signal 2"
+        line1 = re.search(test, tsh)
+        if line1 == None:
+            return False
+        return True
+    except:
+        return False
+
+
+def trace07(tsh):
+    try:
+        test = r"tsh> \.\/myspin 4 \&\s*\[1\] \([0-9]+\) \.\/myspin 4 \&\s*tsh> \.\/myspin 5\s*Job \[2\] \([0-9]+\) terminated by signal 2\s*tsh> jobs\s*\[1\] \([0-9]+\) Running \.\/myspin 4 \&"
+        line1 = re.search(test, tsh)
+        if line1 == None:
+            return False
+        return True
+    except:
+        return False
+
+
+def trace08(tsh):
+    try:
+        test = r"tsh> \.\/myspin 4 \&\s*\[1\] \([0-9]+\) \.\/myspin 4 \&\s*tsh> \.\/myspin 5\s*Job \[2\] \([0-9]+\) stopped by signal 20\s*tsh> jobs\s*\[1\] \([0-9]+\) Running \.\/myspin 4 \&\s*\[2\] \([0-9]+\) Stopped \.\/myspin 5"
+        line1 = re.search(test, tsh)
+        # feedback.set_global_feedback(str(line1),append=True)
+        if line1 == None:
+            return False
+        return True
+    except Exception as e:
+        # feedback.set_global_feedback(str(e),append=True)
+        return False
+
+
+def trace09(tsh):
+    try:
+        test = r"tsh> \.\/myspin 4 \&\s*\[1\] \([0-9]+\) \.\/myspin 4 \&\s*tsh> \.\/myspin 5\s*Job \[2\] \([0-9]+\) stopped by signal 20\s*tsh> jobs\s*\[1\] \([0-9]+\) Running \.\/myspin 4 \&\s*\[2\] \([0-9]+\) Stopped \.\/myspin 5\s*tsh> bg %2\s*\[2\] \([0-9]+\) \.\/myspin 5\s*tsh> jobs\s*\[1\] \([0-9]+\) Running \.\/myspin 4 \&\s*\[2\] \([0-9]+\) Running \.\/myspin 5"
+        line1 = re.search(test, tsh)
+        if line1 == None:
+            return False
+        return True
+    except:
+        return False
+
+
+def trace10(tsh):
+    try:
+        test = r"tsh> \.\/myspin 4 \&\s*\[1\] \([0-9]+\) \.\/myspin 4 \&\s*tsh> fg %1\s*Job \[1\] \([0-9]+\) stopped by signal 20\s*tsh> jobs\s*\[1\] \([0-9]+\) Stopped \.\/myspin 4 \&\s*tsh> fg %1\s*tsh> jobs"
+        line1 = re.search(test, tsh)
+        if line1 == None:
+            return False
+        return True
+    except:
+        return False
+
+
+def trace11(tsh):
+    try:
+        test = r"tsh> ./mysplit 4\s*Job \[1\] \([0-9]+\) terminated by signal 2\s*tsh> \/bin\/ps a\s*PID\s*TTY\s*STAT\s*TIME\s*COMMAND\s*"
+        line1 = re.search(test, tsh)  # end of span
+        if line1 == None:
+            return False
+        test = r"[0-9]+.*.\/mysplit.*"
+        line2 = re.search(test, tsh)
+        if not line2 == None:
+            return False
+        return True
+    except:
+        return False
+
+
+def trace12(tsh):
+    test = r"tsh> \.\/mysplit 4\s*Job \[1\] \([0-9]+\) stopped by signal 20\s*tsh> jobs\s*\[1\] \([0-9]+\) Stopped ./mysplit 4\s*tsh> \/bin\/ps a\s*    PID TTY      STAT   TIME COMMAND\s*"
+    line1 = re.search(test, tsh)
+    if line1 == None:
+        return False
+    test = r"[0-9]+ pts.*.\/mysplit.*"
+    line2 = re.findall(test, tsh)
+    for line in line2:
+        line = line.split()
+        if line[2] != "T":
+            return False
+    return True
+
+
+def trace13(tsh):
+    test = r"tsh> \.\/mysplit 4\s*Job \[1\] \([0-9]+\) stopped by signal 20\s*tsh> jobs\s*\[1\] \([0-9]+\) Stopped ./mysplit 4\s*tsh> \/bin\/ps a\s*    PID TTY      STAT   TIME COMMAND\s*"
+    line1 = re.search(test, tsh)
+    if line1 == None:
+        return False
+    test = r"[0-9]+ pts.*.\/mysplit.*"
+    line2 = re.finditer(test, tsh)
+    count = 0
+    for line in line2:
+        count += 1
+        line = line[0].split()
+        if line[2] != "T":
+            return False
+    if count > 2:
+        return False
+    test = r"tsh> /bin/ps a"
+    line4 = re.finditer(test, tsh)
+    matches = []
+    for line in line4:
+        matches.append(line)
+    if len(matches) != 2:
+        return False
+    test = r"tsh> fg %1"
+    line3 = re.search(test, tsh)
+    if line3 == None:
+        return False
+    line3 = line3.span()
+    if matches[0].span()[1] < line3[0] and line3[1] < matches[1].span()[1]:
+        return True
+    return False
+
+
+def trace14(tsh):
+    test = r"tsh> \.\/bogus\s*\.\/bogus: Command not found\s*tsh> \.\/myspin 4 \&\s*\[1\] \([0-9]+\) \.\/myspin 4 \&\s*tsh> fg\s*fg command requires PID or %jobid argument\s*tsh> bg\s*bg command requires PID or %jobid argument\s*tsh> fg a\s*fg: argument must be a PID or %jobid\s*tsh> bg a\s*bg: argument must be a PID or %jobid\s*tsh> fg 9999999\s*\(9999999\): No such process\s*tsh> bg 9999999\s*\(9999999\): No such process\s*tsh> fg %2\s*%2: No such job\s*tsh> fg %1\s*Job \[1\] \([0-9]+\) stopped by signal 20\s*tsh> bg %2\s*%2: No such job\s*tsh> bg %1\s*\[1\] \([0-9]+\) \.\/myspin 4 \&\s*tsh> jobs\s*\[1\] \([0-9]+\) Running \.\/myspin 4 \&"
+    line1 = re.search(test, tsh)
+    if line1 == None:
+        return False
+    return True
+
+
+def trace15(tsh):
+    test = r"tsh> \.\/bogus\s*\.\/bogus: Command not found\s*tsh> \.\/myspin 10\s*Job \[1\] \([0-9]+\) terminated by signal 2\s*tsh> \.\/myspin 3 \&\s*\[1\] \([0-9]+\) \.\/myspin 3 \&\s*tsh> \.\/myspin 4 \&\s*\[2\] \([0-9]+\) \.\/myspin 4 \&\s*tsh> jobs\s\[1\] \([0-9]+\) Running \.\/myspin 3 \&\s*\[2\] \([0-9]+\) Running \.\/myspin 4 \&\s*tsh> fg %1\s*Job \[1\] \([0-9]+\) stopped by signal 20\s*tsh> jobs\s*\[1\] \([0-9]+\) Stopped \.\/myspin 3 \&\s*\[2\] \([0-9]+\) Running \.\/myspin 4 \&\s*tsh> bg %3\s*%3: No such job\s*tsh> bg %1\s*\[1\] \([0-9]+\) \.\/myspin 3 \&\s*tsh> jobs\s*\[1\] \([0-9]+\) Running \.\/myspin 3 \&\s*\[2\] \([0-9]+\) Running \.\/myspin 4 \&\s*tsh> fg %1\s*tsh> quit"
+    line1 = re.search(test, tsh)
+    if line1 == None:
+        return False
+    return True
+
+
+def trace16(tsh):
+    test = r"tsh> \.\/mystop 2\s*Job \[1\] \([0-9]+\) stopped by signal 20\s*tsh> jobs\s*\[1\] \([0-9]+\) Stopped \.\/mystop 2\s*tsh> \.\/myint 2\s*Job \[2\] \([0-9]+\) terminated by signal 2"
+    line1 = re.search(test, tsh)
+    # feedback.set_global_feedback(str(line1),append=True)
+    if line1 == None:
+        return False
+    return True
+
+
+if __name__ == '__main__':
+    testfunc = [trace01, trace02, trace03, trace04, trace05, trace06, trace07,
+                trace08, trace09, trace10, trace11, trace12, trace13, trace14, trace15, trace16]
+
+    # first is the driver, second arg is test dir, third is the test to run,
+
+    driver = sys.argv[1]
+    test_dir = sys.argv[2]
+    test_shell = sys.argv[3]
+
+    for i in range(0, len(testfunc)):
+        trace = "trace" + str(i+1).zfill(2) + ".txt"
+        res = os.popen(driver + " -s " + test_shell + " -t " + trace + " -a -p").read()
+        if not testfunc[i](res):
+            print("Test " + str(i+1) + " failed")
+        else:
+            print("Test " + str(i+1) + " passed")

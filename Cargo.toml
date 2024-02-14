@@ -1,3 +1,3 @@
 [workspace]
-members = ["bin","tsh"]
+members = ["bin","tsh","tests"]
 resolver = "2"

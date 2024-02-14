@@ -1,3 +1,4 @@
+use std::path::Path;
 fn main() {
-    println!("Hello, world!");
+    println!("{}",Path::new(env!("CARGO_MANIFEST_DIR")).to_str().unwrap());
 }
