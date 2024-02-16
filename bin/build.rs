@@ -1,5 +1,4 @@
 use std::process::Command;
-use std::path::Path;
 
 const FILES: [&str; 4] = ["myint", "mysplit", "mystop", "myspin"];
 

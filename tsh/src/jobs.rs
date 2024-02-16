@@ -6,16 +6,14 @@ pub trait Jobs {
     fn list(&self) -> String;
     fn add_job(&mut self, job: Job) -> Result<(), ()>;
     fn remove_job(&mut self, pid: Pid) -> Result<(), ()>;
-    fn get_pid_mut(&mut self, pid: Pid) -> Result<&mut Job, ()>;
-    fn get_jid_mut(&mut self, jid: u32) -> Result<&mut Job, ()>;
     fn get_pid(&self, pid: Pid) -> Result<&Job, ()>;
     fn get_jid(&self, jid: u32) -> Result<&Job, ()>;
-    // fn set_state_jid(&self, jid: u32, state: States) -> Result<(),()>;
-    // fn set_state_pid(&self, pid: Pid, state: States) -> Result<(),()>;
-    fn fg(&mut self) -> Result<&mut Job, ()>;
+    fn set_state(&mut self, pid:Pid, state:States)->Result<&Job,()>;
+    fn fg(&mut self) -> Option<Pid>;
     fn next_jid(&mut self) -> u32;
 }
 
+#[derive(Debug)]
 pub enum States {
     FG,
     BG,
@@ -32,6 +30,7 @@ impl Display for States {
     }
 }
 
+#[derive(Debug)]
 pub struct Job {
     pub pid: Pid,
     pub jid: u32,
@@ -52,48 +51,46 @@ impl Display for Job {
     }
 }
 
+#[derive(Debug)]
 pub struct JobManager {
-    fg: Option<usize>,
+    fg: Option<Pid>,
     jobs: Vec<Job>,
     next_jid: u32,
 }
 
 impl Jobs for JobManager {
-    fn get_jid_mut(&mut self, jid: u32) -> Result<&mut Job, ()> {
-        let index = match self.jobs.iter().position(|job| job.jid == jid) {
+    fn set_state(&mut self, pid:Pid, state:States)->Result<&Job,()> {
+        if let Some(fg) = self.fg {
+            if fg == pid {
+                match state {
+                    States::ST => {self.fg = None},
+                    _ => {}
+                };
+            };
+        } 
+        let index = match self.jobs.iter().position(|job| job.pid == dbg!(pid)) {
             Some(index) => index,
             None => {
                 return Err(());
             }
         };
-
-        Ok(&mut self.jobs[index])
-    }
-    fn get_pid_mut(&mut self, pid: Pid) -> Result<&mut Job, ()> {
-        let index = match self.jobs.iter().position(|job| job.pid == pid) {
-            Some(index) => index,
-            None => {
-                return Err(());
-            }
-        };
-
-        Ok(&mut self.jobs[index])
+        self.jobs[index].state = state;
+        Ok(&self.jobs[index])
+        
     }
     fn remove_job(&mut self, pid: Pid) -> Result<(), ()> {
-        let index = match self.jobs.iter().position(|job| job.pid == pid) {
+        dbg!(&self);
+        let index = match self.jobs.iter().position(|job| job.pid == dbg!(pid)) {
             Some(index) => index,
             None => {
                 return Err(());
             }
         };
 
-        match &self.fg {
-            Some(fg) => {
-                if self.jobs[*fg].pid == pid {
-                    self.fg = None;
-                }
+        if let Some(fg) = self.fg{
+            if fg == pid {
+                self.fg = None;
             }
-            None => {}
         }
 
         self.jobs.remove(index);
@@ -118,23 +115,29 @@ impl Jobs for JobManager {
         Ok(&self.jobs[index])
     }
     fn add_job(&mut self, job: Job) -> Result<(), ()> {
+        dbg!(&self);
+        let jid= self.next_jid();
         if let States::FG = job.state {
-            if let Some(_) = self.fg {
+            if let Some(_fg) = self.fg {
                 return Err(());
             }
-            self.jobs.push(job);
-            self.fg = Some(self.jobs.len()-1);
+            self.fg = Some(job.pid);
+            self.jobs.push(Job{
+                jid,
+                ..job
+            });
             Ok(())
         }else {
-            self.jobs.push(job);
+            self.fg = None;
+            self.jobs.push(Job{
+                jid,
+                ..job
+            });
             Ok(())
         }
     }
-    fn fg(&mut self) -> Result<&mut Job, ()> {
-        match &mut self.fg {
-            Some(fg) => Ok(&mut self.jobs[*fg]),
-            None => Err(()),
-        }
+    fn fg(&mut self) -> Option<Pid> {
+        self.fg
     }
     fn list(&self) -> String {
         let mut res: String = String::new();
@@ -144,13 +147,17 @@ impl Jobs for JobManager {
         res
     }
     fn next_jid(&mut self) -> u32 {
-        if self.jobs.len() == 0 {
-            self.next_jid = 1;
-            return self.next_jid;
+        // if self.jobs.len() == 0 {
+        //     self.next_jid = 1;
+        //     return self.next_jid;
+        // }
+        // let jid = self.next_jid;
+        // self.next_jid += 1;
+        // jid
+        match self.jobs.last() {
+            Some(job) => {job.jid+1},
+            None => {1},
         }
-        let jid = self.next_jid;
-        self.next_jid += 1;
-        jid
     }
 }
 
@@ -160,6 +167,17 @@ impl JobManager {
             next_jid: 1,
             fg: None,
             jobs: vec![],
+        }
+    }
+}
+
+impl Job {
+    pub fn new(pid:Pid, state:States,cmd:String) -> Self {
+        Self{
+            pid,
+            state,
+            cmd,
+            jid: u32::MAX
         }
     }
 }

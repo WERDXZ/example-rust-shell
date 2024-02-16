@@ -6,20 +6,23 @@ use helpers::unix_error;
 use jobs::{JobManager, Jobs, States};
 use nix::{
     errno::Errno,
-    libc::c_int as sig_t,
     sys::{
-        signal::{kill, signal, sigprocmask, SigHandler, SigmaskHow, Signal},
+        signal::{kill, sigprocmask, SigmaskHow, Signal},
         signalfd::SigSet,
+        wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{execv, fork, pipe, read, setpgid, ForkResult, Pid},
+    unistd::{execv, fork, pipe, read, setpgid, write, ForkResult, Pid},
 };
 use std::{
     env::args,
     ffi::{CStr, CString},
     io::{stdin, stdout, Write},
     process::exit,
-    sync::atomic::{AtomicBool, AtomicI32, Ordering},
+    ptr,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering},
 };
+
+use i32 as sig_t;
 
 const PROMT_STR: &'static str = "tsh>";
 
@@ -27,6 +30,7 @@ static VERBOSE: AtomicBool = AtomicBool::new(false);
 static PROMT: AtomicBool = AtomicBool::new(true);
 
 static LOCK: (AtomicI32, AtomicI32) = (AtomicI32::new(-1), AtomicI32::new(-1));
+static JOBMANAGER: AtomicPtr<JobManager> = AtomicPtr::new(ptr::null_mut());
 
 fn main() {
     for arg in args() {
@@ -42,7 +46,6 @@ fn main() {
             helpers::usage();
             continue;
         }
-        helpers::usage();
     }
 
     unsafe {
@@ -53,14 +56,24 @@ fn main() {
 }
 
 unsafe fn init() {
-    signal(
-        Signal::SIGQUIT,
-        SigHandler::Handler(helpers::sigquit_handler),
-    )
-    .unwrap();
-    signal(Signal::SIGSTOP, SigHandler::Handler(sigstop_handler)).unwrap();
-    signal(Signal::SIGINT, SigHandler::Handler(sigint_handler)).unwrap();
-    signal(Signal::SIGCHLD, SigHandler::Handler(sigchld_handler)).unwrap();
+    use helpers::{set_handler, sigquit_handler};
+
+    match set_handler(Signal::SIGQUIT, sigquit_handler) {
+        Ok(_) => {}
+        Err(_e) => unix_error("Set SIGQUIT handler failed"),
+    }
+    match set_handler(Signal::SIGTSTP, sigstp_handler) {
+        Ok(_) => {}
+        Err(_e) => unix_error("Set SIGSTOP handler failed"),
+    }
+    match set_handler(Signal::SIGINT, sigint_handler) {
+        Ok(_) => {}
+        Err(_e) => unix_error("Set SIGINT handler failed"),
+    }
+    match set_handler(Signal::SIGCHLD, sigchld_handler) {
+        Ok(_) => {}
+        Err(_e) => unix_error("Set SIGCHLD handler failed"),
+    }
 
     let lock = match pipe() {
         Ok(lock) => lock,
@@ -69,10 +82,11 @@ unsafe fn init() {
 
     LOCK.0.store(lock.0, Ordering::Relaxed);
     LOCK.1.store(lock.1, Ordering::Relaxed);
+
+    JOBMANAGER.store(&mut JobManager::new(), Ordering::Release);
 }
 
 fn start() {
-    let mut job_manager = JobManager::new();
     loop {
         {}
         let mut line = String::new();
@@ -90,51 +104,66 @@ fn start() {
                 unix_error(&e.to_string());
             }
         }
-        eval(&line, &mut job_manager);
+        if line.len() == 0 {
+            break;
+        }
+        eval(&line);
     }
 }
 
-fn eval<JobM: Jobs>(line: &str, manager: &mut JobM) {
+fn eval(line: &str) {
     let (argv, isbg) = helpers::parse_line(line);
+    if isbg {
+        println!("get background job");
+    }
+
+    if argv.len() == 0 {
+        return;
+    }
+
+    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
 
     match argv[0].as_str() {
         "quit" => quit(),
-        "jobs" => jobs(manager),
+        "jobs" => jobs(),
         "bg" => {
+            if argv.len() == 1 {
+                println!("bg command requires PID or %jobid argument");
+                return;
+            }
             if let Ok(pid) = argv[1].parse::<i32>() {
                 // bg(&mut manager.get_pid_mut(Pid::from_raw(pid)));
-                if let Ok(job) = manager.get_pid_mut(Pid::from_raw(pid)) {
-                    bg(job);
-                }
+                bg(Pid::from_raw(pid));
             } else if argv[1].chars().next().unwrap_or('\0') == '%' {
                 if let Ok(jid) = argv[1][1..].parse::<u32>() {
-                    if let Ok(job) = manager.get_jid_mut(jid) {
-                        bg(job);
+                    if let Ok(job) = manager.get_jid(jid) {
+                        bg(job.pid);
                     }
                 }
             }
         }
         "fg" => {
+            if argv.len() == 1 {
+                println!("bg command requires PID or %jobid argument");
+                return;
+            }
             if let Ok(pid) = argv[1].parse::<i32>() {
-                // bg(&mut manager.get_pid_mut(Pid::from_raw(pid)));
-                if let Ok(job) = manager.get_pid_mut(Pid::from_raw(pid)) {
-                    fg(job);
-                }
+                fg(Pid::from_raw(pid));
             } else if argv[1].chars().next().unwrap_or('\0') == '%' {
                 if let Ok(jid) = argv[1][1..].parse::<u32>() {
-                    if let Ok(job) = manager.get_jid_mut(jid) {
-                        fg(job);
+                    if let Ok(job) = manager.get_jid(jid) {
+                        fg(job.pid);
                     }
                 }
             }
         }
         _ => {
-            exec(manager, line, argv, isbg);
+            exec(line, argv, isbg);
         }
     };
 }
 
-fn exec(manager: &mut dyn Jobs, line: &str, argv: Vec<String>, isbg: bool) {
+fn exec(line: &str, argv: Vec<String>, isbg: bool) {
     let mut mask: SigSet = SigSet::empty();
     mask.add(Signal::SIGCHLD);
     match sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None) {
@@ -157,28 +186,21 @@ fn exec(manager: &mut dyn Jobs, line: &str, argv: Vec<String>, isbg: bool) {
             Ok(res) => res,
             Err(_e) => unix_error("Cannot fork"),
         };
+        let manager = dbg!(JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap());
 
         match res {
             ForkResult::Parent { child } => {
                 if isbg {
                     let next_jid = manager.next_jid();
-                    manager.add_job(Job {
-                        pid: child,
-                        jid: next_jid,
-                        state: States::BG,
-                        cmd: line.to_string(),
-                    }).unwrap();
+                    manager
+                        .add_job(Job::new(child, States::BG, line.to_string()))
+                        .unwrap();
                     sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
                     println!("[{}] ({}) {}", next_jid, child.as_raw(), line.trim_end());
-                }
-                else {
-                    let next_jid = manager.next_jid();
-                    manager.add_job(Job {
-                        pid: child,
-                        jid: next_jid,
-                        state: States::FG,
-                        cmd: line.to_string(),
-                    }).unwrap();
+                } else {
+                    manager
+                        .add_job(Job::new(child, States::FG, line.to_string()))
+                        .unwrap();
                     sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
                     waitfg(child);
                 }
@@ -203,24 +225,43 @@ fn quit() {
     exit(0);
 }
 
-fn jobs(manager: &dyn Jobs) {
-    println!("{}", manager.list().trim_end());
+fn jobs() {
+    println!(
+        "{}",
+        unsafe { JOBMANAGER.load(Ordering::Relaxed).as_ref().unwrap() }
+            .list()
+            .trim_end()
+    );
 }
 
-fn bg(target: &mut Job) {
-    target.state = States::BG;
-    match kill(target.pid, Signal::SIGCONT) {
+fn bg(target: Pid) {
+    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
+    match kill(target, Signal::SIGCONT) {
         Ok(_) => {}
         Err(_) => unix_error("Send SIGCONT failed"),
+    };
+    let target = match manager.set_state(target, States::BG) {
+        Ok(job) => job,
+        Err(_e) => {
+            println!("({}): Not found", target.as_raw());
+            return;
+        }
     };
     println!("[{}] ({}) {}", target.jid, target.pid, target.cmd);
 }
 
-fn fg(target: &mut Job) {
-    target.state = States::FG;
-    match kill(target.pid, Signal::SIGCONT) {
+fn fg(target: Pid) {
+    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
+    match kill(target, Signal::SIGCONT) {
         Ok(_) => {}
         Err(_) => unix_error("Send SIGCONT failed"),
+    };
+    let target = match manager.set_state(target, States::FG) {
+        Ok(job) => job,
+        Err(_e) => {
+            println!("({}): Not found", target.as_raw());
+            return;
+        }
     };
     waitfg(target.pid);
 }
@@ -233,14 +274,99 @@ fn waitfg(_pid: Pid) {
     };
 }
 
-extern "C" fn sigstop_handler(sigquit: sig_t) {
-    unimplemented!()
+extern "C" fn sigstp_handler(sigquit: sig_t) {
+    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
+    let fgpid = match manager.fg() {
+        Some(pid) => pid.as_raw(),
+        None => return,
+    };
+
+    kill(Pid::from_raw(-fgpid), Signal::try_from(sigquit).unwrap()).unwrap();
 }
 
 extern "C" fn sigint_handler(sigquit: sig_t) {
-    unimplemented!()
+    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
+    let fgpid = match manager.fg() {
+        Some(pid) => pid.as_raw(),
+        None => return,
+    };
+
+    kill(Pid::from_raw(-fgpid), Signal::try_from(sigquit).unwrap()).unwrap();
 }
 
-extern "C" fn sigchld_handler(sigquit: sig_t) {
-    unimplemented!()
+extern "C" fn sigchld_handler(_sigchld: sig_t) {
+    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
+    let mut flag = WaitPidFlag::empty();
+    let fgpid = match manager.fg() {
+        Some(pid) => pid.as_raw(),
+        None => -1,
+    };
+    flag.set(WaitPidFlag::WNOHANG, true);
+    flag.set(WaitPidFlag::WUNTRACED, true);
+    loop {
+        let res = match waitpid(None, Some(flag)) {
+            Ok(res) => res,
+            Err(_e) => {
+                if let Errno::ECHILD = _e {
+                    break;
+                }
+                unix_error("WaitPid Error")
+            }
+        };
+
+        match res {
+            WaitStatus::Stopped(pid, signal) => {
+                manager.set_state(pid, States::ST).unwrap();
+                println!(
+                    "Job [{}] ({}) stopped by signal {}",
+                    manager.get_pid(pid).unwrap().jid,
+                    pid,
+                    signal
+                );
+                match fgpid {
+                    -1 => {}
+                    _ => match write(LOCK.1.load(Ordering::Relaxed), &[0, 0, 0, 0]) {
+                        Ok(_) => {}
+                        Err(_e) => {
+                            unix_error("Pipe write failed");
+                        }
+                    },
+                }
+            }
+            WaitStatus::Signaled(pid, signal, _core_dumped) => {
+                println!(
+                    "Job [{}] ({}) terminated by signal {}",
+                    manager.get_pid(pid).unwrap().jid,
+                    pid,
+                    signal
+                );
+                manager.remove_job(pid).unwrap();
+                match fgpid {
+                    -1 => {}
+                    _ => match write(LOCK.1.load(Ordering::Relaxed), &[0, 0, 0, 0]) {
+                        Ok(_) => {}
+                        Err(_e) => {
+                            unix_error("Pipe write failed");
+                        }
+                    },
+                }
+            }
+            WaitStatus::Exited(pid, _exitcode) => {
+                manager.remove_job(pid).unwrap();
+                match fgpid {
+                    -1 => {}
+                    _ => match write(LOCK.1.load(Ordering::Relaxed), &[0, 0, 0, 0]) {
+                        Ok(_) => {}
+                        Err(_e) => {
+                            unix_error("Pipe write failed");
+                        }
+                    },
+                }
+            }
+            WaitStatus::StillAlive => {
+                break;
+            }
+            _ => {}
+        }
+    }
 }
