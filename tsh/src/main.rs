@@ -83,7 +83,7 @@ unsafe fn init() {
     LOCK.0.store(lock.0, Ordering::Relaxed);
     LOCK.1.store(lock.1, Ordering::Relaxed);
 
-    JOBMANAGER.store(&mut JobManager::new(), Ordering::Release);
+    JOBMANAGER.store( Box::leak(Box::new(JobManager::new())), Ordering::Release);
 }
 
 fn start() {
@@ -144,7 +144,7 @@ fn eval(line: &str) {
         }
         "fg" => {
             if argv.len() == 1 {
-                println!("bg command requires PID or %jobid argument");
+                println!("fg command requires PID or %jobid argument");
                 return;
             }
             if let Ok(pid) = argv[1].parse::<i32>() {
@@ -186,7 +186,7 @@ fn exec(line: &str, argv: Vec<String>, isbg: bool) {
             Ok(res) => res,
             Err(_e) => unix_error("Cannot fork"),
         };
-        let manager = dbg!(JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap());
+        let manager = JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap();
 
         match res {
             ForkResult::Parent { child } => {
@@ -252,6 +252,12 @@ fn bg(target: Pid) {
 
 fn fg(target: Pid) {
     let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
+    let mut mask: SigSet = SigSet::empty();
+    mask.add(Signal::SIGCHLD);
+    match sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None) {
+        Ok(_) => {}
+        Err(_e) => unix_error("Unable to block signal"),
+    };
     match kill(target, Signal::SIGCONT) {
         Ok(_) => {}
         Err(_) => unix_error("Send SIGCONT failed"),
@@ -263,6 +269,9 @@ fn fg(target: Pid) {
             return;
         }
     };
+
+    sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
+    jobs();
     waitfg(target.pid);
 }
 
