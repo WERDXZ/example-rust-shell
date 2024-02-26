@@ -17,6 +17,7 @@ use std::{
     env::args,
     ffi::{CStr, CString},
     io::{stdin, stdout, Write},
+    os::fd::{AsRawFd, BorrowedFd},
     process::exit,
     ptr,
     sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering},
@@ -31,6 +32,7 @@ static PROMT: AtomicBool = AtomicBool::new(true);
 
 static LOCK: (AtomicI32, AtomicI32) = (AtomicI32::new(-1), AtomicI32::new(-1));
 static JOBMANAGER: AtomicPtr<JobManager> = AtomicPtr::new(ptr::null_mut());
+// static LOCK: AtomicPtr<(OwnedFd,OwnedFd)> = AtomicPtr::new(ptr::null_mut());
 
 fn main() {
     for arg in args() {
@@ -80,10 +82,12 @@ unsafe fn init() {
         Err(_e) => unix_error("Create pipe failed"),
     };
 
-    LOCK.0.store(lock.0, Ordering::Relaxed);
-    LOCK.1.store(lock.1, Ordering::Relaxed);
+    LOCK.0.store(lock.0.as_raw_fd(), Ordering::Relaxed);
+    LOCK.1.store(lock.1.as_raw_fd(), Ordering::Relaxed);
 
-    JOBMANAGER.store( Box::leak(Box::new(JobManager::new())), Ordering::Release);
+    Box::leak(Box::new(lock));
+
+    JOBMANAGER.store(Box::leak(Box::new(JobManager::new())), Ordering::Release);
 }
 
 fn start() {
@@ -94,14 +98,14 @@ fn start() {
             print!("{}", PROMT_STR);
             match stdout().flush() {
                 Ok(_) => {}
-                Err(e) => unix_error(&e.to_string()),
+                Err(e) => unix_error(&dbg!(e).to_string()),
             };
         }
 
         match stdin().read_line(&mut line) {
             Ok(_) => {}
             Err(e) => {
-                unix_error(&e.to_string());
+                unix_error(&dbg!(e).to_string());
             }
         }
         if line.len() == 0 {
@@ -334,7 +338,10 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                 );
                 match fgpid {
                     -1 => {}
-                    _ => match write(LOCK.1.load(Ordering::Relaxed), &[0, 0, 0, 0]) {
+                    _ => match write(
+                        unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) },
+                        &[0, 0, 0, 0],
+                    ) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");
@@ -352,7 +359,7 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                 manager.remove_job(pid).unwrap();
                 match fgpid {
                     -1 => {}
-                    _ => match write(LOCK.1.load(Ordering::Relaxed), &[0, 0, 0, 0]) {
+                    _ => match write(unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) }, &[0, 0, 0, 0]) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");
@@ -364,7 +371,7 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                 manager.remove_job(pid).unwrap();
                 match fgpid {
                     -1 => {}
-                    _ => match write(LOCK.1.load(Ordering::Relaxed), &[0, 0, 0, 0]) {
+                    _ => match write(unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) }, &[0, 0, 0, 0]) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");

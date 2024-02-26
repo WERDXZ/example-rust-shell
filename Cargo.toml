@@ -1,3 +1,18 @@
+[package]
+name = "tsh"
+version = "0.1.0"
+edition = "2021"
+authors = ["WERDXZ <WERDXZ@werdxz.info>"]
+
 [workspace]
-members = ["bin","tsh","tests"]
+members = ["bin","."]
 resolver = "2"
+
+[dependencies]
+nix = { version = "0.28.0", features = ["signal"] }
+regex = "1.10.3"
+
+[dev-dependencies]
+similar = "2.4.0"
+similar-asserts = "1.5.0"
+
