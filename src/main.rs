@@ -25,7 +25,7 @@ use std::{
 
 use i32 as sig_t;
 
-const PROMT_STR: &'static str = "tsh>";
+const PROMT_STR: &'static str = "tsh> ";
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 static PROMT: AtomicBool = AtomicBool::new(true);
@@ -117,9 +117,6 @@ fn start() {
 
 fn eval(line: &str) {
     let (argv, isbg) = helpers::parse_line(line);
-    if isbg {
-        println!("get background job");
-    }
 
     if argv.len() == 0 {
         return;
@@ -178,6 +175,7 @@ fn exec(line: &str, argv: Vec<String>, isbg: bool) {
     let argct = CString::new(argv[0].clone()).unwrap();
     let argcc = argct.as_c_str();
     let argvt: Vec<CString> = argv
+        .clone()
         .into_iter()
         .map(|s| CString::new(s.clone()).unwrap())
         .collect();
@@ -211,15 +209,17 @@ fn exec(line: &str, argv: Vec<String>, isbg: bool) {
             }
             ForkResult::Child => {
                 setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
-                execv(argcc, argvc.as_slice()).unwrap();
-                #[allow(unreachable_code)]
-                {
-                    if Errno::last() == Errno::ENOENT {
-                        println!("{}: Command not found", argv[0]);
-                    } else {
+                match execv(argcc, argvc.as_slice()) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if e == Errno::ENOENT {
+                            println!("{}: Command not found", argv[0]);
+                            exit(0);
+                        } 
                         unix_error("Execv Error");
+                        
                     }
-                }
+                };
             }
         }
     }
@@ -334,7 +334,7 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                     "Job [{}] ({}) stopped by signal {}",
                     manager.get_pid(pid).unwrap().jid,
                     pid,
-                    signal
+                    signal as i32
                 );
                 match fgpid {
                     -1 => {}
@@ -354,12 +354,15 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                     "Job [{}] ({}) terminated by signal {}",
                     manager.get_pid(pid).unwrap().jid,
                     pid,
-                    signal
+                    signal as i32
                 );
                 manager.remove_job(pid).unwrap();
                 match fgpid {
                     -1 => {}
-                    _ => match write(unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) }, &[0, 0, 0, 0]) {
+                    _ => match write(
+                        unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) },
+                        &[0, 0, 0, 0],
+                    ) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");
@@ -371,7 +374,10 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                 manager.remove_job(pid).unwrap();
                 match fgpid {
                     -1 => {}
-                    _ => match write(unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) }, &[0, 0, 0, 0]) {
+                    _ => match write(
+                        unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) },
+                        &[0, 0, 0, 0],
+                    ) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");
