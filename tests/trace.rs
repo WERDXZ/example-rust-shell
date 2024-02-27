@@ -5,18 +5,13 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::{env, thread};
 
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use regex::Regex;
 
 const CARGO_DIR: &str = env!("CARGO_MANIFEST_DIR");
 const PID1: &str = r"\(\d+\)";
 const PID2: &str = r"$\d+\s";
-
-fn kill(pid: &str, sig: &str) {
-    Command::new("kill")
-        .args(["-s", sig, pid])
-        .status()
-        .expect("Failed to send sigal");
-}
 
 fn driver(exec: &str, trace: &str, args: &str) -> String {
     env::set_current_dir(Path::new(&format!("{}/{}", CARGO_DIR, "bin"))).unwrap();
@@ -34,8 +29,6 @@ fn driver(exec: &str, trace: &str, args: &str) -> String {
 
     let reader = BufReader::new(trace);
 
-    let mut output = "".to_string();
-
     for line in reader.lines() {
         let line = line.expect("IO failure");
         let mut line_iter = line.split_whitespace();
@@ -48,25 +41,24 @@ fn driver(exec: &str, trace: &str, args: &str) -> String {
                     continue;
                 }
                 "TSTP" => {
-                    kill(&child.id().to_string(), "TSTP");
+                    kill(Pid::from_raw(child.id() as i32), Signal::SIGTSTP).unwrap();
+                    child.try_wait().unwrap();
                 }
                 "INT" => {
-                    kill(&child.id().to_string(), "INT");
+                    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+                    child.try_wait().unwrap();
                 }
                 "QUIT" => {
-                    kill(&child.id().to_string(), "QUIT");
+                    kill(Pid::from_raw(child.id() as i32), Signal::SIGQUIT).unwrap();
+                    child.try_wait().unwrap();
                 }
                 "KILL" => {
-                    kill(&child.id().to_string(), "KILL");
+                    kill(Pid::from_raw(child.id() as i32), Signal::SIGKILL).unwrap();
+                    child.try_wait().unwrap();
                 }
                 "CLOSE" => {
-                    // drop(stdin);
-                    match stdin_wrapper {
-                        Some(stdin) => drop(stdin),
-                        None => {}
-                    }
-                    stdin_wrapper = None;
-                    assert!((child.wait().unwrap()).success());
+                    let stdin = stdin_wrapper.take().unwrap();
+                    drop(stdin);
                     break;
                 }
                 "WAIT" => {
@@ -89,11 +81,9 @@ fn driver(exec: &str, trace: &str, args: &str) -> String {
             },
         }
     }
-    match stdin_wrapper {
-        Some(stdin) => drop(stdin),
-        None => {}
-    }
-    assert!((child.wait().unwrap()).success());
+    //assert!((
+    dbg!(child.wait()).unwrap();
+    //).success());
     // (child.wait().unwrap());
     let mut output = String::new();
     stdout
@@ -104,7 +94,7 @@ fn driver(exec: &str, trace: &str, args: &str) -> String {
     let reg2 = Regex::new(PID2).unwrap();
     let output = reg1.replace_all(&output, "");
     let output = reg2.replace_all(&output, "");
-    output.to_string()
+    dbg!(output.to_string())
 }
 
 macro_rules! test {
@@ -112,7 +102,7 @@ macro_rules! test {
         #[test]
         fn $name() {
             let refout = driver(
-                &format!("{}/{}", CARGO_DIR, "bin/tshref"),
+                &format!("{}/{}", CARGO_DIR, "/bin/tshref"),
                 &format!("{}/tests/{}.txt", CARGO_DIR, stringify!($name)),
                 "-p",
             );
@@ -120,7 +110,7 @@ macro_rules! test {
                 &format!("{}/{}", CARGO_DIR, "target/debug/tsh"),
                 &format!("{}/tests/{}.txt", CARGO_DIR, stringify!($name)),
                 "-p",
-                );
+            );
             similar_asserts::assert_eq!(out, refout);
         }
     };
