@@ -5,8 +5,6 @@ use nix::sys::{
 use regex::Regex;
 use std::{os::raw::c_int, process::exit};
 
-pub use nix::sys::signal::signal;
-
 pub extern "C" fn sigquit_handler(_sigquit: i32) {
     println!("Terminating after receipt of SIGQUIT signal");
     exit(0)
