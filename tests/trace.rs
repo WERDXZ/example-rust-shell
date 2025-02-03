@@ -20,19 +20,19 @@ fn driver(exec: &str, trace: &str, args: &str) -> String {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect(&format!("{exec} not found"));
+        .unwrap_or_else(|_| panic!("{exec} not found"));
 
     let mut stdin_wrapper = child.stdin.take();
     let mut stdout = BufReader::new(child.stdout.take().expect("Failed to open stdout"));
 
-    let trace = File::open(trace).expect(&format!("trace file {trace} not found"));
+    let trace = File::open(trace).unwrap_or_else(|_| panic!("trace file {trace} not found"));
 
     let reader = BufReader::new(trace);
 
     for line in reader.lines() {
         let line = line.expect("IO failure");
         let mut line_iter = line.split_whitespace();
-        match line_iter.nth(0) {
+        match line_iter.next() {
             None => {
                 continue;
             }
@@ -72,11 +72,8 @@ fn driver(exec: &str, trace: &str, args: &str) -> String {
                     };
                     thread::sleep(Duration::from_secs(time));
                 }
-                _ => match stdin_wrapper {
-                    Some(ref mut stdin) => {
-                        writeln!(stdin, "{}", line).expect("unable to write to pipe");
-                    }
-                    None => {}
+                _ => if let Some(ref mut stdin) = stdin_wrapper {
+                    writeln!(stdin, "{}", line).expect("unable to write to pipe");
                 },
             },
         }
