@@ -17,37 +17,33 @@ use std::{
     env::args,
     ffi::{CStr, CString},
     io::{stdin, stdout, Write},
-    os::fd::{AsRawFd, BorrowedFd},
+    os::fd::{AsRawFd, OwnedFd},
     process::exit,
-    ptr,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering},
+    sync::{LazyLock, Mutex},
 };
 
 use i32 as sig_t;
 
-const PROMT_STR: &'static str = "tsh> ";
+const PROMT_STR: &str = "tsh> ";
 
-static VERBOSE: AtomicBool = AtomicBool::new(false);
-static PROMT: AtomicBool = AtomicBool::new(true);
+static VERBOSE: LazyLock<bool> =
+    LazyLock::new(|| args().any(|arg| arg == "-v" || arg == "--verbose"));
+static PROMT: LazyLock<bool> = LazyLock::new(|| args().all(|arg| arg != "-p" && arg != "--prompt"));
 
-static LOCK: (AtomicI32, AtomicI32) = (AtomicI32::new(-1), AtomicI32::new(-1));
-static JOBMANAGER: AtomicPtr<JobManager> = AtomicPtr::new(ptr::null_mut());
-// static LOCK: AtomicPtr<(OwnedFd,OwnedFd)> = AtomicPtr::new(ptr::null_mut());
+static LOCK: LazyLock<(OwnedFd, OwnedFd)> = LazyLock::new(|| match pipe() {
+    Ok(lock) => lock,
+    Err(_e) => unix_error("Create pipe failed"),
+});
+static JOBMANAGER: LazyLock<Mutex<JobManager>> = LazyLock::new(|| Mutex::new(JobManager::new()));
 
 fn main() {
-    for arg in args() {
-        if arg == "-v" || arg == "--verbose" {
-            VERBOSE.store(true, Ordering::Relaxed);
-            continue;
-        }
-        if arg == "-p" || arg == "--promt" {
-            PROMT.store(false, Ordering::Relaxed);
-            continue;
-        }
-        if arg == "-h" || arg == "--help" {
-            helpers::usage();
-            continue;
-        }
+    if *VERBOSE {
+        println!("tsh: Version 1.0");
+    }
+
+    if args().any(|arg| arg == "-h" || arg == "--help") {
+        helpers::usage();
+        return;
     }
 
     unsafe {
@@ -76,25 +72,13 @@ unsafe fn init() {
         Ok(_) => {}
         Err(_e) => unix_error("Set SIGCHLD handler failed"),
     }
-
-    let lock = match pipe() {
-        Ok(lock) => lock,
-        Err(_e) => unix_error("Create pipe failed"),
-    };
-
-    LOCK.0.store(lock.0.as_raw_fd(), Ordering::Relaxed);
-    LOCK.1.store(lock.1.as_raw_fd(), Ordering::Relaxed);
-
-    Box::leak(Box::new(lock));
-
-    JOBMANAGER.store(Box::leak(Box::new(JobManager::new())), Ordering::Release);
 }
 
 fn start() {
     loop {
         {}
         let mut line = String::new();
-        if PROMT.load(Ordering::Relaxed) {
+        if *PROMT {
             print!("{}", PROMT_STR);
             match stdout().flush() {
                 Ok(_) => {}
@@ -108,7 +92,7 @@ fn start() {
                 unix_error(&dbg!(e).to_string());
             }
         }
-        if line.len() == 0 {
+        if line.is_empty() {
             break;
         }
         eval(&line);
@@ -118,11 +102,9 @@ fn start() {
 fn eval(line: &str) {
     let (argv, isbg) = helpers::parse_line(line);
 
-    if argv.len() == 0 {
+    if argv.is_empty() {
         return;
     }
-
-    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
 
     match argv[0].as_str() {
         "quit" => quit(),
@@ -137,7 +119,7 @@ fn eval(line: &str) {
                 bg(Pid::from_raw(pid));
             } else if argv[1].chars().next().unwrap_or('\0') == '%' {
                 if let Ok(jid) = argv[1][1..].parse::<u32>() {
-                    if let Ok(job) = manager.get_jid(jid) {
+                    if let Ok(job) = { JOBMANAGER.lock().unwrap().get_jid(jid) } {
                         bg(job.pid);
                     }
                 }
@@ -152,7 +134,7 @@ fn eval(line: &str) {
                 fg(Pid::from_raw(pid));
             } else if argv[1].chars().next().unwrap_or('\0') == '%' {
                 if let Ok(jid) = argv[1][1..].parse::<u32>() {
-                    if let Ok(job) = manager.get_jid(jid) {
+                    if let Ok(job) = { JOBMANAGER.lock().unwrap().get_jid(jid) } {
                         fg(job.pid);
                     }
                 }
@@ -183,44 +165,46 @@ fn exec(line: &str, argv: Vec<String>, isbg: bool) {
     for arg in argvt.iter() {
         argvc.push(arg.as_c_str());
     }
-    unsafe {
-        let res = match fork() {
-            Ok(res) => res,
-            Err(_e) => unix_error("Cannot fork"),
-        };
-        let manager = JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap();
+    let res = match unsafe { fork() } {
+        Ok(res) => res,
+        Err(_e) => unix_error("Cannot fork"),
+    };
 
-        match res {
-            ForkResult::Parent { child } => {
-                if isbg {
-                    let next_jid = manager.next_jid();
+    match res {
+        ForkResult::Parent { child } => {
+            if isbg {
+                let next_jid = {
+                    let mut manager = JOBMANAGER.lock().unwrap();
                     manager
                         .add_job(Job::new(child, States::BG, line.to_string()))
                         .unwrap();
-                    sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
-                    println!("[{}] ({}) {}", next_jid, child.as_raw(), line.trim_end());
-                } else {
+                    manager.next_jid()
+                };
+                sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
+                println!("[{}] ({}) {}", next_jid, child.as_raw(), line.trim_end());
+            } else {
+                {
+                    let mut manager = JOBMANAGER.lock().unwrap();
                     manager
                         .add_job(Job::new(child, States::FG, line.to_string()))
                         .unwrap();
-                    sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
-                    waitfg(child);
                 }
+                sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
+                waitfg(child);
             }
-            ForkResult::Child => {
-                setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
-                match execv(argcc, argvc.as_slice()) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if e == Errno::ENOENT {
-                            println!("{}: Command not found", argv[0]);
-                            exit(0);
-                        } 
-                        unix_error("Execv Error");
-                        
+        }
+        ForkResult::Child => {
+            setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
+            match execv(argcc, argvc.as_slice()) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e == Errno::ENOENT {
+                        println!("{}: Command not found", argv[0]);
+                        exit(0);
                     }
-                };
-            }
+                    unix_error("Execv Error");
+                }
+            };
         }
     }
 }
@@ -230,16 +214,11 @@ fn quit() {
 }
 
 fn jobs() {
-    println!(
-        "{}",
-        unsafe { JOBMANAGER.load(Ordering::Relaxed).as_ref().unwrap() }
-            .list()
-            .trim_end()
-    );
+    println!("{}", JOBMANAGER.lock().unwrap().list().trim_end());
 }
 
 fn bg(target: Pid) {
-    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
+    let mut manager = JOBMANAGER.lock().unwrap();
     match kill(target, Signal::SIGCONT) {
         Ok(_) => {}
         Err(_) => unix_error("Send SIGCONT failed"),
@@ -255,7 +234,6 @@ fn bg(target: Pid) {
 }
 
 fn fg(target: Pid) {
-    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
     let mut mask: SigSet = SigSet::empty();
     mask.add(Signal::SIGCHLD);
     match sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None) {
@@ -266,30 +244,32 @@ fn fg(target: Pid) {
         Ok(_) => {}
         Err(_) => unix_error("Send SIGCONT failed"),
     };
-    let target = match manager.set_state(target, States::FG) {
-        Ok(job) => job,
-        Err(_e) => {
-            println!("({}): Not found", target.as_raw());
-            return;
+    let target = {
+        let mut manager = JOBMANAGER.lock().unwrap();
+        match manager.set_state(target, States::FG) {
+            Ok(job) => job.pid,
+            Err(_e) => {
+                println!("({}): Not found", target.as_raw());
+                return;
+            }
         }
     };
 
     sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
     jobs();
-    waitfg(target.pid);
+    waitfg(target);
 }
 
 fn waitfg(_pid: Pid) {
     let mut buffer: [u8; 4] = [0, 0, 0, 0];
-    match read(LOCK.0.load(Ordering::Relaxed), &mut buffer) {
+    match read(LOCK.0.as_raw_fd(), &mut buffer) {
         Ok(_) => {}
         Err(_e) => unix_error("Pipe Read Error"),
     };
 }
 
 extern "C" fn sigstp_handler(sigquit: sig_t) {
-    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
-    let fgpid = match manager.fg() {
+    let fgpid = match JOBMANAGER.lock().unwrap().fg() {
         Some(pid) => pid.as_raw(),
         None => return,
     };
@@ -298,8 +278,7 @@ extern "C" fn sigstp_handler(sigquit: sig_t) {
 }
 
 extern "C" fn sigint_handler(sigquit: sig_t) {
-    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
-    let fgpid = match manager.fg() {
+    let fgpid = match JOBMANAGER.lock().unwrap().fg() {
         Some(pid) => pid.as_raw(),
         None => return,
     };
@@ -308,9 +287,8 @@ extern "C" fn sigint_handler(sigquit: sig_t) {
 }
 
 extern "C" fn sigchld_handler(_sigchld: sig_t) {
-    let manager = unsafe { JOBMANAGER.load(Ordering::Relaxed).as_mut().unwrap() };
     let mut flag = WaitPidFlag::empty();
-    let fgpid = match manager.fg() {
+    let fgpid = match JOBMANAGER.lock().unwrap().fg() {
         Some(pid) => pid.as_raw(),
         None => -1,
     };
@@ -329,19 +307,20 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
 
         match res {
             WaitStatus::Stopped(pid, signal) => {
-                manager.set_state(pid, States::ST).unwrap();
+                JOBMANAGER
+                    .lock()
+                    .unwrap()
+                    .set_state(pid, States::ST)
+                    .unwrap();
                 println!(
                     "Job [{}] ({}) stopped by signal {}",
-                    manager.get_pid(pid).unwrap().jid,
+                    { JOBMANAGER.lock().unwrap().get_pid(pid).unwrap().jid },
                     pid,
                     signal as i32
                 );
                 match fgpid {
                     -1 => {}
-                    _ => match write(
-                        unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) },
-                        &[0, 0, 0, 0],
-                    ) {
+                    _ => match write(&LOCK.1, &[0, 0, 0, 0]) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");
@@ -352,17 +331,14 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
             WaitStatus::Signaled(pid, signal, _core_dumped) => {
                 println!(
                     "Job [{}] ({}) terminated by signal {}",
-                    manager.get_pid(pid).unwrap().jid,
+                    { JOBMANAGER.lock().unwrap().get_pid(pid).unwrap().jid },
                     pid,
                     signal as i32
                 );
-                manager.remove_job(pid).unwrap();
+                JOBMANAGER.lock().unwrap().remove_job(pid).unwrap();
                 match fgpid {
                     -1 => {}
-                    _ => match write(
-                        unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) },
-                        &[0, 0, 0, 0],
-                    ) {
+                    _ => match write(&LOCK.1, &[0, 0, 0, 0]) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");
@@ -371,13 +347,10 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                 }
             }
             WaitStatus::Exited(pid, _exitcode) => {
-                manager.remove_job(pid).unwrap();
+                JOBMANAGER.lock().unwrap().remove_job(pid).unwrap();
                 match fgpid {
                     -1 => {}
-                    _ => match write(
-                        unsafe { BorrowedFd::borrow_raw(LOCK.1.load(Ordering::Relaxed)) },
-                        &[0, 0, 0, 0],
-                    ) {
+                    _ => match write(&LOCK.1, &[0, 0, 0, 0]) {
                         Ok(_) => {}
                         Err(_e) => {
                             unix_error("Pipe write failed");
