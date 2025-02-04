@@ -12,3 +12,6 @@ TSTP
 
 /bin/echo tsh> jobs
 jobs
+
+/bin/echo -e tsh> fg %2
+fg %2

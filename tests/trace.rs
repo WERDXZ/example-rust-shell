@@ -72,16 +72,16 @@ fn driver(exec: &str, trace: &str, args: &str) -> String {
                     };
                     thread::sleep(Duration::from_secs(time));
                 }
-                _ => if let Some(ref mut stdin) = stdin_wrapper {
-                    writeln!(stdin, "{}", line).expect("unable to write to pipe");
-                },
+                _ => {
+                    if let Some(ref mut stdin) = stdin_wrapper {
+                        writeln!(stdin, "{}", line).expect("unable to write to pipe");
+                    }
+                }
             },
         }
     }
-    //assert!((
+    drop(stdin_wrapper);
     dbg!(child.wait()).unwrap();
-    //).success());
-    // (child.wait().unwrap());
     let mut output = String::new();
     stdout
         .read_to_string(&mut output)

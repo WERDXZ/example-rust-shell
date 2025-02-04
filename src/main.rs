@@ -11,18 +11,28 @@ use nix::{
         signalfd::SigSet,
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{execv, fork, pipe, read, setpgid, write, ForkResult, Pid},
+    unistd::{execv, fork, setpgid, ForkResult, Pid},
 };
 use std::{
     env::args,
     ffi::{CStr, CString},
     io::{stdin, stdout, Write},
-    os::fd::{AsRawFd, OwnedFd},
     process::exit,
-    sync::{LazyLock, Mutex},
+    sync::{
+        mpsc,
+        mpsc::{Receiver, Sender},
+        LazyLock, Mutex,
+    },
 };
 
 use i32 as sig_t;
+#[derive(Debug)]
+enum MessageQueue {
+    RemoveJob { pid: Pid },
+    Stopped { pid: Pid, signal: i32 },
+    Signaled { pid: Pid, signal: i32 },
+    Signal { signal: i32 },
+}
 
 const PROMT_STR: &str = "tsh> ";
 
@@ -30,11 +40,28 @@ static VERBOSE: LazyLock<bool> =
     LazyLock::new(|| args().any(|arg| arg == "-v" || arg == "--verbose"));
 static PROMT: LazyLock<bool> = LazyLock::new(|| args().all(|arg| arg != "-p" && arg != "--prompt"));
 
-static LOCK: LazyLock<(OwnedFd, OwnedFd)> = LazyLock::new(|| match pipe() {
-    Ok(lock) => lock,
-    Err(_e) => unix_error("Create pipe failed"),
+type Key = Mutex<Sender<()>>;
+type Lock = Mutex<Receiver<()>>;
+static LOCK: LazyLock<(Key, Lock)> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::channel::<()>();
+    (Mutex::new(tx), Mutex::new(rx))
 });
 static JOBMANAGER: LazyLock<Mutex<JobManager>> = LazyLock::new(|| Mutex::new(JobManager::new()));
+
+type SenderT = Mutex<Sender<MessageQueue>>;
+type ReceiverT = Mutex<Receiver<MessageQueue>>;
+static MESSAGES: LazyLock<(SenderT, ReceiverT)> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::channel::<MessageQueue>();
+    (Mutex::new(tx), Mutex::new(rx))
+});
+
+macro_rules! log {
+    ($($arg:tt)*) => {
+        if *VERBOSE {
+            println!($($arg)*);
+        }
+    };
+}
 
 fn main() {
     if *VERBOSE {
@@ -75,6 +102,7 @@ unsafe fn init() {
 }
 
 fn start() {
+    std::thread::spawn(receiver);
     loop {
         {}
         let mut line = String::new();
@@ -107,20 +135,21 @@ fn eval(line: &str) {
     }
 
     match argv[0].as_str() {
-        "quit" => quit(),
-        "jobs" => jobs(),
+        "quit" => exit(0),
+        "jobs" => println!("{}", JOBMANAGER.lock().unwrap().list().trim_end()),
         "bg" => {
             if argv.len() == 1 {
                 println!("bg command requires PID or %jobid argument");
                 return;
             }
             if let Ok(pid) = argv[1].parse::<i32>() {
-                // bg(&mut manager.get_pid_mut(Pid::from_raw(pid)));
-                bg(Pid::from_raw(pid));
+                if let Ok(job) = { JOBMANAGER.lock().unwrap().get_pid_mut(Pid::from_raw(pid)) } {
+                    job.bg();
+                }
             } else if argv[1].chars().next().unwrap_or('\0') == '%' {
                 if let Ok(jid) = argv[1][1..].parse::<u32>() {
-                    if let Ok(job) = { JOBMANAGER.lock().unwrap().get_jid(jid) } {
-                        bg(job.pid);
+                    if let Ok(job) = { JOBMANAGER.lock().unwrap().get_jid_mut(jid) } {
+                        job.bg();
                     }
                 }
             }
@@ -130,14 +159,30 @@ fn eval(line: &str) {
                 println!("fg command requires PID or %jobid argument");
                 return;
             }
-            if let Ok(pid) = argv[1].parse::<i32>() {
-                fg(Pid::from_raw(pid));
+            if let Some(pid) = if let Ok(pid) = argv[1].parse::<i32>() {
+                if let Ok(job) = JOBMANAGER.lock().unwrap().get_pid_mut(Pid::from_raw(pid)) {
+                    job.fg();
+                    Some(job.pid)
+                } else {
+                    None
+                }
             } else if argv[1].chars().next().unwrap_or('\0') == '%' {
                 if let Ok(jid) = argv[1][1..].parse::<u32>() {
-                    if let Ok(job) = { JOBMANAGER.lock().unwrap().get_jid(jid) } {
-                        fg(job.pid);
+                    if let Ok(job) = JOBMANAGER.lock().unwrap().get_jid_mut(jid) {
+                        job.fg();
+                        Some(job.pid)
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
+            } else {
+                None
+            } {
+                JOBMANAGER.lock().unwrap().set_fg(pid);
+                println!("{}", JOBMANAGER.lock().unwrap().list().trim_end());
+                waitfg();
             }
         }
         _ => {
@@ -173,15 +218,14 @@ fn exec(line: &str, argv: Vec<String>, isbg: bool) {
     match res {
         ForkResult::Parent { child } => {
             if isbg {
-                let next_jid = {
+                let jid = {
                     let mut manager = JOBMANAGER.lock().unwrap();
                     manager
                         .add_job(Job::new(child, States::BG, line.to_string()))
-                        .unwrap();
-                    manager.next_jid()
+                        .unwrap()
                 };
                 sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
-                println!("[{}] ({}) {}", next_jid, child.as_raw(), line.trim_end());
+                println!("[{}] ({}) {}", jid, child.as_raw(), line.trim_end());
             } else {
                 {
                     let mut manager = JOBMANAGER.lock().unwrap();
@@ -190,7 +234,7 @@ fn exec(line: &str, argv: Vec<String>, isbg: bool) {
                         .unwrap();
                 }
                 sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
-                waitfg(child);
+                waitfg();
             }
         }
         ForkResult::Child => {
@@ -209,89 +253,70 @@ fn exec(line: &str, argv: Vec<String>, isbg: bool) {
     }
 }
 
-fn quit() {
-    exit(0);
+impl Job {
+    fn bg(&mut self) {
+        match kill(self.pid, Signal::SIGCONT) {
+            Ok(_) => {}
+            Err(_) => unix_error("Send SIGCONT failed"),
+        };
+        self.state = States::BG;
+
+        log!("Backgrounding job id: {}", self.jid);
+
+        println!("[{}] ({}) {}", self.jid, self.pid, self.cmd);
+    }
+
+    fn fg(&mut self) {
+        let mut mask: SigSet = SigSet::empty();
+        mask.add(Signal::SIGCHLD);
+        match sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None) {
+            Ok(_) => {}
+            Err(_e) => unix_error("Unable to block signal"),
+        };
+
+        match kill(self.pid, Signal::SIGCONT) {
+            Ok(_) => {}
+            Err(_) => unix_error("Send SIGCONT failed"),
+        };
+
+        self.state = States::FG;
+
+        match sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None) {
+            Ok(_) => {}
+            Err(_e) => unix_error("Unable to unblock signal"),
+        };
+
+        log!("Forgrounding job id: {}", self.jid);
+    }
 }
 
-fn jobs() {
-    println!("{}", JOBMANAGER.lock().unwrap().list().trim_end());
+fn waitfg() {
+    LOCK.1.lock().unwrap().recv().unwrap();
 }
 
-fn bg(target: Pid) {
-    let mut manager = JOBMANAGER.lock().unwrap();
-    match kill(target, Signal::SIGCONT) {
-        Ok(_) => {}
-        Err(_) => unix_error("Send SIGCONT failed"),
-    };
-    let target = match manager.set_state(target, States::BG) {
-        Ok(job) => job,
-        Err(_e) => {
-            println!("({}): Not found", target.as_raw());
-            return;
-        }
-    };
-    println!("[{}] ({}) {}", target.jid, target.pid, target.cmd);
-}
-
-fn fg(target: Pid) {
-    let mut mask: SigSet = SigSet::empty();
-    mask.add(Signal::SIGCHLD);
-    match sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None) {
-        Ok(_) => {}
-        Err(_e) => unix_error("Unable to block signal"),
-    };
-    match kill(target, Signal::SIGCONT) {
-        Ok(_) => {}
-        Err(_) => unix_error("Send SIGCONT failed"),
-    };
-    let target = {
-        let mut manager = JOBMANAGER.lock().unwrap();
-        match manager.set_state(target, States::FG) {
-            Ok(job) => job.pid,
-            Err(_e) => {
-                println!("({}): Not found", target.as_raw());
-                return;
-            }
-        }
-    };
-
-    sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&mask), None).unwrap();
-    jobs();
-    waitfg(target);
-}
-
-fn waitfg(_pid: Pid) {
-    let mut buffer: [u8; 4] = [0, 0, 0, 0];
-    match read(LOCK.0.as_raw_fd(), &mut buffer) {
-        Ok(_) => {}
-        Err(_e) => unix_error("Pipe Read Error"),
-    };
-}
-
-extern "C" fn sigstp_handler(sigquit: sig_t) {
-    let fgpid = match JOBMANAGER.lock().unwrap().fg() {
-        Some(pid) => pid.as_raw(),
-        None => return,
-    };
-
-    kill(Pid::from_raw(-fgpid), Signal::try_from(sigquit).unwrap()).unwrap();
+extern "C" fn sigstp_handler(sigstp: sig_t) {
+    log!("Received SIGTSTP");
+    MESSAGES
+        .0
+        .lock()
+        .unwrap()
+        .send(MessageQueue::Signal { signal: sigstp })
+        .unwrap();
 }
 
 extern "C" fn sigint_handler(sigquit: sig_t) {
-    let fgpid = match JOBMANAGER.lock().unwrap().fg() {
-        Some(pid) => pid.as_raw(),
-        None => return,
-    };
-
-    kill(Pid::from_raw(-fgpid), Signal::try_from(sigquit).unwrap()).unwrap();
+    log!("Received SIGINT");
+    MESSAGES
+        .0
+        .lock()
+        .unwrap()
+        .send(MessageQueue::Signal { signal: sigquit })
+        .unwrap();
 }
 
 extern "C" fn sigchld_handler(_sigchld: sig_t) {
+    log!("Received SIGCHLD");
     let mut flag = WaitPidFlag::empty();
-    let fgpid = match JOBMANAGER.lock().unwrap().fg() {
-        Some(pid) => pid.as_raw(),
-        None => -1,
-    };
     flag.set(WaitPidFlag::WNOHANG, true);
     flag.set(WaitPidFlag::WUNTRACED, true);
     loop {
@@ -305,8 +330,71 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
             }
         };
 
+        log!("Waitpid returned: {:?}", res);
+
         match res {
             WaitStatus::Stopped(pid, signal) => {
+                log!("Handling stopped job");
+                MESSAGES
+                    .0
+                    .lock()
+                    .unwrap()
+                    .send(MessageQueue::Stopped {
+                        pid,
+                        signal: signal as i32,
+                    })
+                    .unwrap();
+            }
+            WaitStatus::Signaled(pid, signal, _core_dumped) => {
+                log!("Handling signaled job");
+                MESSAGES
+                    .0
+                    .lock()
+                    .unwrap()
+                    .send(MessageQueue::Signaled {
+                        pid,
+                        signal: signal as i32,
+                    })
+                    .unwrap();
+            }
+            WaitStatus::Exited(pid, _exitcode) => {
+                log!("Handling exited job");
+                MESSAGES
+                    .0
+                    .lock()
+                    .unwrap()
+                    .send(MessageQueue::RemoveJob { pid })
+                    .unwrap();
+            }
+            WaitStatus::StillAlive => {
+                break;
+            }
+            _ => {}
+        }
+
+        log!("Message sent");
+    }
+}
+
+fn receiver() {
+    log!("Receiver started");
+    loop {
+        let message = MESSAGES.1.lock().unwrap().recv().unwrap();
+        log!("Message received: {:?}", message);
+        let fgpid = match JOBMANAGER.lock().unwrap().current() {
+            Some(pid) => pid.as_raw(),
+            None => -1,
+        };
+        log!("Current FG: {}", fgpid);
+        match message {
+            MessageQueue::RemoveJob { pid } => {
+                JOBMANAGER.lock().unwrap().remove_job(pid).unwrap();
+                match fgpid {
+                    -1 => {}
+                    _ => LOCK.0.lock().unwrap().send(()).unwrap(),
+                }
+            }
+            MessageQueue::Stopped { pid, signal } => {
                 JOBMANAGER
                     .lock()
                     .unwrap()
@@ -316,52 +404,32 @@ extern "C" fn sigchld_handler(_sigchld: sig_t) {
                     "Job [{}] ({}) stopped by signal {}",
                     { JOBMANAGER.lock().unwrap().get_pid(pid).unwrap().jid },
                     pid,
-                    signal as i32
+                    signal
                 );
                 match fgpid {
                     -1 => {}
-                    _ => match write(&LOCK.1, &[0, 0, 0, 0]) {
-                        Ok(_) => {}
-                        Err(_e) => {
-                            unix_error("Pipe write failed");
-                        }
-                    },
+                    _ => LOCK.0.lock().unwrap().send(()).unwrap(),
                 }
             }
-            WaitStatus::Signaled(pid, signal, _core_dumped) => {
+            MessageQueue::Signaled { pid, signal } => {
+                JOBMANAGER.lock().unwrap().remove_job(pid).unwrap();
+
                 println!(
                     "Job [{}] ({}) terminated by signal {}",
                     { JOBMANAGER.lock().unwrap().get_pid(pid).unwrap().jid },
                     pid,
-                    signal as i32
+                    signal
                 );
-                JOBMANAGER.lock().unwrap().remove_job(pid).unwrap();
                 match fgpid {
                     -1 => {}
-                    _ => match write(&LOCK.1, &[0, 0, 0, 0]) {
-                        Ok(_) => {}
-                        Err(_e) => {
-                            unix_error("Pipe write failed");
-                        }
-                    },
+                    _ => LOCK.0.lock().unwrap().send(()).unwrap(),
                 }
             }
-            WaitStatus::Exited(pid, _exitcode) => {
-                JOBMANAGER.lock().unwrap().remove_job(pid).unwrap();
-                match fgpid {
-                    -1 => {}
-                    _ => match write(&LOCK.1, &[0, 0, 0, 0]) {
-                        Ok(_) => {}
-                        Err(_e) => {
-                            unix_error("Pipe write failed");
-                        }
-                    },
+            MessageQueue::Signal { signal } => {
+                if fgpid != -1 {
+                    kill(Pid::from_raw(-fgpid), Signal::try_from(signal).unwrap()).unwrap();
                 }
             }
-            WaitStatus::StillAlive => {
-                break;
-            }
-            _ => {}
         }
     }
 }

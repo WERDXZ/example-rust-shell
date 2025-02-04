@@ -4,12 +4,16 @@ use nix::unistd::Pid;
 
 pub trait Jobs {
     fn list(&self) -> String;
-    fn add_job(&mut self, job: Job) -> Result<(), ()>;
+    fn add_job(&mut self, job: Job) -> Result<u32, ()>;
     fn remove_job(&mut self, pid: Pid) -> Result<(), ()>;
     fn get_pid(&self, pid: Pid) -> Result<&Job, ()>;
+    #[allow(unused)]
     fn get_jid(&self, jid: u32) -> Result<&Job, ()>;
+    fn get_pid_mut(&mut self, pid: Pid) -> Result<&mut Job, ()>;
+    fn get_jid_mut(&mut self, jid: u32) -> Result<&mut Job, ()>;
     fn set_state(&mut self, pid: Pid, state: States) -> Result<&Job, ()>;
-    fn fg(&mut self) -> Option<Pid>;
+    fn set_fg(&mut self, pid: Pid);
+    fn current(&mut self) -> Option<Pid>;
     fn next_jid(&mut self) -> u32;
 }
 
@@ -84,6 +88,9 @@ impl Jobs for JobManager {
         self.jobs[index].state = state;
         Ok(&self.jobs[index])
     }
+    fn set_fg(&mut self, pid: Pid) {
+        self.fg = Some(pid);
+    }
     fn remove_job(&mut self, pid: Pid) -> Result<(), ()> {
         let index = match self.jobs.iter().position(|job| job.pid == (pid)) {
             Some(index) => index,
@@ -119,7 +126,25 @@ impl Jobs for JobManager {
         };
         Ok(&self.jobs[index])
     }
-    fn add_job(&mut self, job: Job) -> Result<(), ()> {
+    fn get_jid_mut(&mut self, jid: u32) -> Result<&mut Job, ()> {
+        let index = match self.jobs.iter().position(|job| job.jid == jid) {
+            Some(index) => index,
+            None => {
+                return Err(());
+            }
+        };
+        Ok(&mut self.jobs[index])
+    }
+    fn get_pid_mut(&mut self, pid: Pid) -> Result<&mut Job, ()> {
+        let index = match self.jobs.iter().position(|job| job.pid == pid) {
+            Some(index) => index,
+            None => {
+                return Err(());
+            }
+        };
+        Ok(&mut self.jobs[index])
+    }
+    fn add_job(&mut self, job: Job) -> Result<u32, ()> {
         let jid = self.next_jid();
         if let States::FG = job.state {
             if let Some(_fg) = self.fg {
@@ -127,14 +152,14 @@ impl Jobs for JobManager {
             }
             self.fg = Some(job.pid);
             self.jobs.push(Job { jid, ..job });
-            Ok(())
+            Ok(jid)
         } else {
             self.fg = None;
             self.jobs.push(Job { jid, ..job });
-            Ok(())
+            Ok(jid)
         }
     }
-    fn fg(&mut self) -> Option<Pid> {
+    fn current(&mut self) -> Option<Pid> {
         self.fg
     }
     fn list(&self) -> String {
